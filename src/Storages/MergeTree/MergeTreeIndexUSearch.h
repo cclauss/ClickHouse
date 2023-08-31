@@ -22,6 +22,7 @@ public:
     void serialize(WriteBuffer & ostr) const;
     void deserialize(ReadBuffer & istr);
     size_t getDimensions() const;
+    size_t memoryUsageBytes() const;
 };
 
 template <unum::usearch::metric_kind_t Metric>
@@ -40,6 +41,8 @@ struct MergeTreeIndexGranuleUSearch final : public IMergeTreeIndexGranule
     void deserializeBinary(ReadBuffer & istr, MergeTreeIndexVersion version) override;
 
     bool empty() const override { return !index.get(); }
+
+    size_t memoryUsageBytes() const override { return index->memoryUsageBytes(); }
 
     const String index_name;
     const Block index_sample_block;
