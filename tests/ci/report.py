@@ -2,18 +2,24 @@
 from ast import literal_eval
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, List, Literal, Optional, Tuple
+from typing import Dict, Final, List, Literal, Optional, Tuple
 from html import escape
 import csv
-import os
 import datetime
+import json
+import logging
+import os
 
-ERROR = "error"  # type: Final
-FAILURE = "failure"  # type: Final
-SUCCESS = "success"  # type: Final
+from ci_config import BuildConfig, CI_CONFIG
 
-OK = "OK"  # type: Final
-FAIL = "FAIL"  # type: Final
+logger = logging.getLogger(__name__)
+
+ERROR: Final = "error"
+FAILURE: Final = "failure"
+SUCCESS: Final = "success"
+
+OK: Final = "OK"
+FAIL: Final = "FAIL"
 
 StatusType = Literal["error", "failure", "success"]
 
@@ -257,12 +263,130 @@ def read_test_results(results_path: Path, with_raw_logs: bool = True) -> TestRes
 
 @dataclass
 class BuildResult:
-    compiler: str
-    debug_build: bool
-    sanitizer: str
-    status: str
+    build_name: str
+    log_url: str
+    build_urls: List[str]
+    version: str
+    status: StatusType
     elapsed_seconds: int
-    comment: str
+    _grouped_urls: Optional[List[List[str]]] = None
+
+    @property
+    def build_config(self) -> Optional[BuildConfig]:
+        return CI_CONFIG.build_config.get(self.build_name, None)
+
+    @property
+    def comment(self) -> str:
+        if self.build_config is None:
+            return self._wrong_config_message
+        return self.build_config.comment
+
+    @property
+    def compiler(self) -> str:
+        if self.build_config is None:
+            return self._wrong_config_message
+        return self.build_config.compiler
+
+    @property
+    def debug_build(self) -> bool:
+        if self.build_config is None:
+            return False
+        return self.build_config.debug_build
+
+    @property
+    def sanitizer(self) -> str:
+        if self.build_config is None:
+            return self._wrong_config_message
+        return self.build_config.sanitizer
+
+    @property
+    def grouped_urls(self) -> List[List[str]]:
+        "Combine and preserve build_urls by artifact types"
+        if self._grouped_urls is not None:
+            return self._grouped_urls
+        artifacts_groups = {
+            "apk": [],
+            "deb": [],
+            "binary": [],
+            "tgz": [],
+            "rpm": [],
+            "performance": [],
+        }  # type: Dict[str, List[str]]
+        for url in self.build_urls:
+            if url.endswith("performance.tar.zst"):
+                artifacts_groups["performance"].append(url)
+            elif (
+                url.endswith(".deb")
+                or url.endswith(".buildinfo")
+                or url.endswith(".changes")
+                or url.endswith(".tar.gz")
+            ):
+                artifacts_groups["deb"].append(url)
+            elif url.endswith(".apk"):
+                artifacts_groups["apk"].append(url)
+            elif url.endswith(".rpm"):
+                artifacts_groups["rpm"].append(url)
+            elif url.endswith(".tgz") or url.endswith(".tgz.sha512"):
+                artifacts_groups["tgz"].append(url)
+            else:
+                artifacts_groups["binary"].append(url)
+        self._grouped_urls = [urls for urls in artifacts_groups.values() if urls]
+        return self._grouped_urls
+
+    @property
+    def _wrong_config_message(self) -> str:
+        return f"wrong config name {self.build_name}"
+
+    @property
+    def file_name(self) -> Path:
+        return self.get_report_name(self.build_name)
+
+    @staticmethod
+    def get_report_name(name: str) -> Path:
+        return Path(f"build_report_{name}.json")
+
+    @staticmethod
+    def read_json(directory: Path, build_name: str) -> "BuildResult":
+        path = directory / BuildResult.get_report_name(build_name)
+        try:
+            with open(path, "r", encoding="utf-8") as pf:
+                data = json.load(pf)  # type: dict
+        except FileNotFoundError:
+            logger.warning(
+                "File %s for build named '%s' is not found", path, build_name
+            )
+            return BuildResult(build_name, "", [], "unknown", ERROR, 0)
+
+        return BuildResult(
+            data.get("build_name", build_name),
+            data.get("log_url", ""),
+            data.get("build_urls", []),
+            data.get("version", ""),
+            data.get("status", ERROR),
+            data.get("elapsed_seconds", 0),
+        )
+
+    def write_json(self, directory: Path) -> Path:
+        path = directory / self.file_name
+        path.write_text(
+            json.dumps(
+                {
+                    "build_name": self.build_name,
+                    "log_url": self.log_url,
+                    "build_urls": self.build_urls,
+                    "version": self.version,
+                    "status": self.status,
+                    "elapsed_seconds": self.elapsed_seconds,
+                }
+            ),
+            encoding="utf-8",
+        )
+        # TODO: remove after the artifacts are in S3 completely
+        env_path = Path(os.getenv("GITHUB_ENV", "/dev/null"))
+        with env_path.open("a", encoding="utf-8") as ef:
+            ef.write(f"BUILD_URLS={path.stem}")
+
+        return path
 
 
 BuildResults = List[BuildResult]
@@ -454,6 +578,7 @@ HTML_BASE_BUILD_TEMPLATE = (
 <tr>
 <th>Compiler</th>
 <th>Build type</th>
+<th>Version</th>
 <th>Sanitizer</th>
 <th>Status</th>
 <th>Build log</th>
@@ -473,60 +598,57 @@ LINK_TEMPLATE = '<a href="{url}">{text}</a>'
 def create_build_html_report(
     header: str,
     build_results: BuildResults,
-    build_logs_urls: List[str],
-    artifact_urls_list: List[List[str]],
     task_url: str,
     branch_url: str,
     branch_name: str,
     commit_url: str,
 ) -> str:
     rows = []
-    for build_result, build_log_url, artifact_urls in zip(
-        build_results, build_logs_urls, artifact_urls_list
-    ):
-        row = ["<tr>"]
-        row.append(f"<td>{build_result.compiler}</td>")
-        if build_result.debug_build:
-            row.append("<td>debug</td>")
-        else:
-            row.append("<td>relwithdebuginfo</td>")
-        if build_result.sanitizer:
-            row.append(f"<td>{build_result.sanitizer}</td>")
-        else:
-            row.append("<td>none</td>")
+    for build_result in build_results:
+        for artifact_urls in build_result.grouped_urls:
+            row = ["<tr>"]
+            row.append(f"<td>{build_result.compiler}</td>")
+            if build_result.debug_build:
+                row.append("<td>debug</td>")
+            else:
+                row.append("<td>relwithdebuginfo</td>")
+            row.append(f"<td>{build_result.version}</td>")
+            if build_result.sanitizer:
+                row.append(f"<td>{build_result.sanitizer}</td>")
+            else:
+                row.append("<td>none</td>")
 
-        if build_result.status:
-            style = _get_status_style(build_result.status)
-            row.append(f'<td style="{style}">{build_result.status}</td>')
-        else:
-            style = _get_status_style(ERROR)
-            row.append(f'<td style="{style}">error</td>')
+            if build_result.status:
+                style = _get_status_style(build_result.status)
+                row.append(f'<td style="{style}">{build_result.status}</td>')
+            else:
+                style = _get_status_style(ERROR)
+                row.append(f'<td style="{style}">error</td>')
 
-        row.append(f'<td><a href="{build_log_url}">link</a></td>')
+            row.append(f'<td><a href="{build_result.log_url}">link</a></td>')
 
-        if build_result.elapsed_seconds:
-            delta = datetime.timedelta(seconds=build_result.elapsed_seconds)
-        else:
-            delta = "unknown"  # type: ignore
+            delta = "unknown"
+            if build_result.elapsed_seconds:
+                delta = str(datetime.timedelta(seconds=build_result.elapsed_seconds))
 
-        row.append(f"<td>{delta}</td>")
+            row.append(f"<td>{delta}</td>")
 
-        links = ""
-        link_separator = "<br/>"
-        if artifact_urls:
-            for artifact_url in artifact_urls:
-                links += LINK_TEMPLATE.format(
-                    text=_get_html_url_name(artifact_url), url=artifact_url
-                )
-                links += link_separator
-            if links:
-                links = links[: -len(link_separator)]
-            row.append(f"<td>{links}</td>")
+            links = ""
+            link_separator = "<br/>"
+            if artifact_urls:
+                for artifact_url in artifact_urls:
+                    links += LINK_TEMPLATE.format(
+                        text=_get_html_url_name(artifact_url), url=artifact_url
+                    )
+                    links += link_separator
+                if links:
+                    links = links[: -len(link_separator)]
+                row.append(f"<td>{links}</td>")
 
-        row.append(f"<td>{build_result.comment}</td>")
+            row.append(f"<td>{build_result.comment}</td>")
 
-        row.append("</tr>")
-        rows.append("".join(row))
+            row.append("</tr>")
+            rows.append("".join(row))
     return HTML_BASE_BUILD_TEMPLATE.format(
         title=_format_header(header, branch_name),
         header=_format_header(header, branch_name, branch_url),

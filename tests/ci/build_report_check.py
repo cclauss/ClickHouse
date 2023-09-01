@@ -6,19 +6,17 @@ import os
 import sys
 import atexit
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 from github import Github
 
 from env_helper import (
     GITHUB_JOB_URL,
     GITHUB_REPOSITORY,
-    GITHUB_RUN_URL,
     GITHUB_SERVER_URL,
     REPORTS_PATH,
     TEMP_PATH,
 )
-from report import create_build_html_report, BuildResult, BuildResults
+from report import create_build_html_report, BuildResult
 from s3_helper import S3Helper
 from get_robot_token import get_best_robot_token
 from pr_info import NeedsDataType, PRInfo
@@ -35,94 +33,17 @@ from ci_config import CI_CONFIG
 NEEDS_DATA_PATH = os.getenv("NEEDS_DATA_PATH", "")
 
 
-def group_by_artifacts(build_urls: List[str]) -> Dict[str, List[str]]:
-    groups = {
-        "apk": [],
-        "deb": [],
-        "binary": [],
-        "tgz": [],
-        "rpm": [],
-        "performance": [],
-    }  # type: Dict[str, List[str]]
-    for url in build_urls:
-        if url.endswith("performance.tar.zst"):
-            groups["performance"].append(url)
-        elif (
-            url.endswith(".deb")
-            or url.endswith(".buildinfo")
-            or url.endswith(".changes")
-            or url.endswith(".tar.gz")
-        ):
-            groups["deb"].append(url)
-        elif url.endswith(".apk"):
-            groups["apk"].append(url)
-        elif url.endswith(".rpm"):
-            groups["rpm"].append(url)
-        elif url.endswith(".tgz") or url.endswith(".tgz.sha512"):
-            groups["tgz"].append(url)
-        else:
-            groups["binary"].append(url)
-    return groups
-
-
-def get_failed_report(
-    job_name: str,
-) -> Tuple[BuildResults, List[List[str]], List[str]]:
-    message = f"{job_name} failed"
-    build_result = BuildResult(
-        compiler="unknown",
-        debug_build=False,
-        sanitizer="unknown",
-        status=message,
-        elapsed_seconds=0,
-        comment="",
-    )
-    return [build_result], [[""]], [GITHUB_RUN_URL]
-
-
-def process_report(
-    build_report: dict,
-) -> Tuple[BuildResults, List[List[str]], List[str]]:
-    build_config = build_report["build_config"]
-    build_result = BuildResult(
-        compiler=build_config["compiler"],
-        debug_build=build_config["debug_build"],
-        sanitizer=build_config["sanitizer"],
-        status="success" if build_report["status"] else "failure",
-        elapsed_seconds=build_report["elapsed_seconds"],
-        comment=build_config["comment"],
-    )
-    build_results = []
-    build_urls = []
-    build_logs_urls = []
-    urls_groups = group_by_artifacts(build_report["build_urls"])
-    found_group = False
-    for _, group_urls in urls_groups.items():
-        if group_urls:
-            build_results.append(build_result)
-            build_urls.append(group_urls)
-            build_logs_urls.append(build_report["log_url"])
-            found_group = True
-
-    # No one group of urls is found, a failed report
-    if not found_group:
-        build_results.append(build_result)
-        build_urls.append([""])
-        build_logs_urls.append(build_report["log_url"])
-
-    return build_results, build_urls, build_logs_urls
-
-
-def get_build_name_from_file_name(file_name):
-    return file_name.replace("build_urls_", "").replace(".json", "")
-
-
 def main():
     logging.basicConfig(level=logging.INFO)
     temp_path = Path(TEMP_PATH)
-    logging.info("Reports path %s", REPORTS_PATH)
-
     temp_path.mkdir(parents=True, exist_ok=True)
+
+    logging.info("Reports path %s", REPORTS_PATH)
+    reports_path = Path(REPORTS_PATH)
+    logging.info(
+        "Reports found:\n %s",
+        "\n ".join(p.as_posix() for p in reports_path.rglob("*.json")),
+    )
 
     build_check_name = sys.argv[1]
     needs_data = {}  # type: NeedsDataType
@@ -152,71 +73,20 @@ def main():
     builds_for_check = CI_CONFIG.builds_report_config[build_check_name]
     required_builds = required_builds or len(builds_for_check)
 
+    missed_builds = 0
     # Collect reports from json artifacts
-    builds_report_map = {}
-    for root, _, files in os.walk(REPORTS_PATH):
-        for f in files:
-            if f.startswith("build_urls_") and f.endswith(".json"):
-                logging.info("Found build report json %s", f)
-                build_name = get_build_name_from_file_name(f)
-                if build_name in builds_for_check:
-                    with open(os.path.join(root, f), "rb") as file_handler:
-                        builds_report_map[build_name] = json.load(file_handler)
-                else:
-                    logging.info(
-                        "Skipping report %s for build %s, it's not in our reports list",
-                        f,
-                        build_name,
-                    )
+    build_results = []
+    for build_name in builds_for_check:
+        report_name = BuildResult.get_report_name(build_name).stem
+        build_result = BuildResult.read_json(reports_path / report_name, build_name)
+        if build_result.version == "unknown":
+            logging.warning("Build results for %s are missing", build_name)
+            missed_builds += 1
+        build_results.append(build_result)
 
-    # Sort reports by config order
-    build_reports = [
-        builds_report_map[build_name]
-        for build_name in builds_for_check
-        if build_name in builds_report_map
-    ]
-
-    some_builds_are_missing = len(build_reports) < required_builds
-    missing_build_names = []
-    if some_builds_are_missing:
-        logging.warning(
-            "Expected to get %s build results, got only %s",
-            required_builds,
-            len(build_reports),
-        )
-        missing_build_names = [
-            name
-            for name in needs_data
-            if not any(rep for rep in build_reports if rep["job_name"] == name)
-        ]
-    else:
-        logging.info("Got exactly %s builds", len(builds_report_map))
-
-    # Group build artifacts by groups
-    build_results = []  # type: BuildResults
-    build_artifacts = []  # type: List[List[str]]
-    build_logs = []  # type: List[str]
-
-    for build_report in build_reports:
-        _build_results, build_artifacts_url, build_logs_url = process_report(
-            build_report
-        )
-        logging.info(
-            "Got %s artifact groups for build report report", len(_build_results)
-        )
-        build_results.extend(_build_results)
-        build_artifacts.extend(build_artifacts_url)
-        build_logs.extend(build_logs_url)
-
-    for failed_job in missing_build_names:
-        _build_results, build_artifacts_url, build_logs_url = get_failed_report(
-            failed_job
-        )
-        build_results.extend(_build_results)
-        build_artifacts.extend(build_artifacts_url)
-        build_logs.extend(build_logs_url)
-
-    total_groups = len(build_results)
+    total_groups = sum(
+        1 for build_result in build_results for urls in build_result.grouped_urls
+    )
     logging.info("Totally got %s artifact groups", total_groups)
     if total_groups == 0:
         logging.error("No success builds, failing check")
@@ -234,8 +104,6 @@ def main():
     report = create_build_html_report(
         build_check_name,
         build_results,
-        build_logs,
-        build_artifacts,
         task_url,
         branch_url,
         branch_name,
@@ -267,18 +135,20 @@ def main():
             summary_status = "error"
 
         if build_result.status == "success":
-            ok_groups += 1
+            ok_groups += len(build_result.grouped_urls)
 
     # Check if there are no builds at all, do not override bad status
     if summary_status == "success":
-        if some_builds_are_missing:
+        if not missed_builds:
             summary_status = "pending"
         elif ok_groups == 0:
             summary_status = "error"
 
     addition = ""
-    if some_builds_are_missing:
-        addition = f" ({len(build_reports)} of {required_builds} builds are OK)"
+    if not missed_builds:
+        addition = (
+            f" ({required_builds - missed_builds} of {required_builds} builds are OK)"
+        )
 
     description = format_description(
         f"{ok_groups}/{total_groups} artifact groups are OK{addition}"
