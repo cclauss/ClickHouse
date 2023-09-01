@@ -2,11 +2,20 @@
 from ast import literal_eval
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Final, List, Literal, Optional, Tuple
 from html import escape
 import csv
 import os
 import datetime
+
+ERROR = "error"  # type: Final
+FAILURE = "failure"  # type: Final
+SUCCESS = "success"  # type: Final
+
+OK = "OK"  # type: Final
+FAIL = "FAIL"  # type: Final
+
+StatusType = Literal["error", "failure", "success"]
 
 ### BEST FRONTEND PRACTICES BELOW
 
@@ -291,8 +300,8 @@ def _format_header(
 
 
 def _get_status_style(status: str, colortheme: Optional[ColorTheme] = None) -> str:
-    ok_statuses = ("OK", "success", "PASSED")
-    fail_statuses = ("FAIL", "failure", "error", "FAILED", "Timeout", "NOT_FAILED")
+    ok_statuses = (OK, SUCCESS, "PASSED")
+    fail_statuses = (FAIL, FAILURE, ERROR, "FAILED", "Timeout", "NOT_FAILED")
 
     if colortheme is None:
         colortheme = ReportColorTheme.default
@@ -490,7 +499,7 @@ def create_build_html_report(
             style = _get_status_style(build_result.status)
             row.append(f'<td style="{style}">{build_result.status}</td>')
         else:
-            style = _get_status_style("error")
+            style = _get_status_style(ERROR)
             row.append(f'<td style="{style}">error</td>')
 
         row.append(f'<td><a href="{build_log_url}">link</a></td>')
