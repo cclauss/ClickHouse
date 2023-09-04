@@ -139,13 +139,13 @@ def main():
 
     # Check if there are no builds at all, do not override bad status
     if summary_status == "success":
-        if not missed_builds:
+        if missed_builds:
             summary_status = "pending"
         elif ok_groups == 0:
             summary_status = "error"
 
     addition = ""
-    if not missed_builds:
+    if missed_builds:
         addition = (
             f" ({required_builds - missed_builds} of {required_builds} builds are OK)"
         )
