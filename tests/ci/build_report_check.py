@@ -16,7 +16,7 @@ from env_helper import (
     REPORTS_PATH,
     TEMP_PATH,
 )
-from report import create_build_html_report, BuildResult
+from report import create_build_html_report, BuildResult, ERROR
 from s3_helper import S3Helper
 from get_robot_token import get_best_robot_token
 from pr_info import NeedsDataType, PRInfo
@@ -79,7 +79,7 @@ def main():
     for build_name in builds_for_check:
         report_name = BuildResult.get_report_name(build_name).stem
         build_result = BuildResult.read_json(reports_path / report_name, build_name)
-        if build_result.version == "unknown":
+        if build_result.version == "unknown" and build_result.status == ERROR:
             logging.warning("Build results for %s are missing", build_name)
             missed_builds += 1
         build_results.append(build_result)
