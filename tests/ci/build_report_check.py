@@ -79,7 +79,7 @@ def main():
     for build_name in builds_for_check:
         report_name = BuildResult.get_report_name(build_name).stem
         build_result = BuildResult.read_json(reports_path / report_name, build_name)
-        if build_result.version == "unknown" and build_result.status == ERROR:
+        if build_result.is_missing:
             logging.warning("Build results for %s are missing", build_name)
             missed_builds += 1
         build_results.append(build_result)

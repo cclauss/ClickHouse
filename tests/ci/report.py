@@ -341,6 +341,16 @@ class BuildResult:
     def file_name(self) -> Path:
         return self.get_report_name(self.build_name)
 
+    @property
+    def is_missing(self) -> bool:
+        "The report is created for missing json file"
+        return not (
+            self.log_url
+            or self.build_urls
+            or self.version != "missing"
+            or self.status != ERROR
+        )
+
     @staticmethod
     def get_report_name(name: str) -> Path:
         return Path(f"build_report_{name}.json")
@@ -355,7 +365,7 @@ class BuildResult:
             logger.warning(
                 "File %s for build named '%s' is not found", path, build_name
             )
-            return BuildResult(build_name, "", [], "unknown", ERROR, 0)
+            return BuildResult(build_name, "", [], "missing", ERROR, 0)
 
         return BuildResult(
             data.get("build_name", build_name),
