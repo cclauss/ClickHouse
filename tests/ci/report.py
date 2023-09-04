@@ -304,6 +304,9 @@ class BuildResult:
         "Combine and preserve build_urls by artifact types"
         if self._grouped_urls is not None:
             return self._grouped_urls
+        if self.is_missing:
+            self._grouped_urls = [[]]
+            return self._grouped_urls
         artifacts_groups = {
             "apk": [],
             "deb": [],
